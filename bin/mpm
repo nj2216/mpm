@@ -112,7 +112,6 @@ _OLD_MPM_PS1="${PS1:-}"
 ENV_BASE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export MPM_ACTIVE_PREFIX="$ENV_BASE"
 
-# Auto-discover all library folders inside this isolated environment
 RAW_LIBS=$(find "$ENV_BASE" -type d \( -name "lib" -o -name "*linux-gnu" \) 2>/dev/null | tr '\n' ':')
 CLEAN_LIBS="${RAW_LIBS%:}"
 
@@ -363,7 +362,6 @@ do_install() {
         dpkg -x "$deb_path" "$PREFIX"
     done
 
-    # Symlink binaries inside this environment's bin/
     for search_dir in "$PREFIX/usr/bin" "$PREFIX/usr/games"; do
         [ -d "$search_dir" ] || continue
         for bin in "$search_dir"/*; do
@@ -374,7 +372,6 @@ do_install() {
         done
     done
 
-    # Safe patchelf RPATH embedding (Fix 1: robust error handling)
     if command -v patchelf &>/dev/null; then
         log_verbose "Patching environment RPATHs with patchelf..."
         local rpath="\$ORIGIN/../lib:\$ORIGIN/../lib/x86_64-linux-gnu:\$ORIGIN/../../usr/lib:\$ORIGIN/../../usr/lib/x86_64-linux-gnu"
@@ -398,60 +395,19 @@ do_install() {
         set -e
     fi
 
-    # Refresh activate script with newly installed library subfolders
     setup_environment_scaffold "$PREFIX"
 
     echo "------------------------------------------------"
     echo -e "\e[32m✔ SUCCESS:\e[0m \e[1m$PACKAGE\e[0m installed into $PREFIX"
     echo ""
     echo "To run commands in this environment:"
-    echo -e "  \e[33mbin/mpm run $PACKAGE [args...]\e[0m"
+    echo -e "  \e[33mmpm run $PACKAGE [args...]\e[0m"
     echo "Or activate it:"
-    echo -e "  \e[33msource $PREFIX/activate\e[0m"
+    echo -e "  \e[33mmpm activate\e[0m (or source $PREFIX/activate)"
 }
 
 # ==========================================
-# SHELL INTEGRATION HOOK
-# ==========================================
-do_shell_hook() {
-    cat << 'EOF'
-mpm() {
-    if [ "$1" = "activate" ]; then
-        shift
-        local target_env="$1"
-        local env_path=""
-
-        if [ -n "$target_env" ]; then
-            env_path="$HOME/.local/share/mpm/environments/$target_env"
-        elif [ -d "./.mpm" ]; then
-            env_path="$(pwd)/.mpm"
-        else
-            echo "Error: No .mpm environment found in current directory." >&2
-            return 1
-        fi
-
-        if [ -f "$env_path/activate" ]; then
-            source "$env_path/activate"
-        else
-            echo "Error: Activation script not found at $env_path/activate" >&2
-            return 1
-        fi
-    elif [ "$1" = "deactivate" ]; then
-        if type deactivate >/dev/null 2>&1; then
-            deactivate
-        else
-            echo "Error: No active mpm environment to deactivate." >&2
-            return 1
-        fi
-    else
-        command mpm "$@"
-    fi
-}
-EOF
-}
-
-# ==========================================
-# 3. RUN SUBCOMMAND (Fix 3: Robust execution)
+# 3. RUN SUBCOMMAND
 # ==========================================
 do_run() {
     local PREFIX
@@ -492,7 +448,46 @@ do_init() {
     PREFIX="$(get_target_prefix)"
     setup_environment_scaffold "$PREFIX"
     echo -e "\e[32m✔\e[0m Initialized isolated environment in \e[1m$PREFIX\e[0m"
-    echo "Activate with: source $PREFIX/activate"
+    echo "Activate with: mpm activate"
+}
+
+# ==========================================
+# 6. SHELL HOOK INTEGRATION
+# ==========================================
+do_shell_hook() {
+    cat << 'EOF'
+mpm() {
+    if [ "$1" = "activate" ]; then
+        shift
+        local target_env="$1"
+        local env_path=""
+        if [ -n "$target_env" ]; then
+            env_path="$HOME/.local/share/mpm/environments/$target_env"
+        elif [ -d "./.mpm" ]; then
+            env_path="$(pwd)/.mpm"
+        else
+            echo "Error: No .mpm environment found in current directory." >&2
+            return 1
+        fi
+
+        if [ -f "$env_path/activate" ]; then
+            source "$env_path/activate"
+        else
+            echo "Error: Activation script not found at $env_path/activate" >&2
+            return 1
+        fi
+    elif [ "$1" = "deactivate" ]; then
+        if type deactivate >/dev/null 2>&1; then
+            deactivate
+        else
+            echo "Error: No active mpm environment to deactivate." >&2
+            return 1
+        fi
+    else
+        command mpm "$@"
+    fi
+}
+EOF
 }
 
 # ==========================================
@@ -521,13 +516,19 @@ COMMAND="$1"
 shift || true
 
 case "$COMMAND" in
-    shell-hook) do_shell_hook ;;
-    init)     do_init ;;
-    update)   do_update ;;
-    search)   do_search "$1" ;;
-    install)  do_install "$1" ;;
-    run)      do_run "$@" ;;
-    clean)    rm -rf "${CACHE_DIR:?}"/* && echo "Cache cleaned." ;;
+    init)        do_init ;;
+    update)      do_update ;;
+    search)      do_search "$1" ;;
+    install)     do_install "$1" ;;
+    run)         do_run "$@" ;;
+    clean)       rm -rf "${CACHE_DIR:?}"/* && echo "Cache cleaned." ;;
+    shell-hook)  do_shell_hook ;;
+    activate)
+        echo "Notice: To activate environments directly with 'mpm activate', run:"
+        echo '  eval "$(mpm shell-hook)"'
+        echo "Or source the file directly:"
+        echo "  source .mpm/activate"
+        ;;
     *)
         echo "MPM: Modern Rootless Package Manager (Isolated Environments)"
         echo "Usage: mpm [-v] [-n <env-name>] <command> [args]"
@@ -539,5 +540,6 @@ case "$COMMAND" in
         echo "  search <query>          Search package in remote indices"
         echo "  update                  Update index cache"
         echo "  clean                   Clear downloaded .deb cache"
+        echo "  shell-hook              Generate shell integration code for mpm activate"
         ;;
 esac
