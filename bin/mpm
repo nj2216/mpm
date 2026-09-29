@@ -411,6 +411,46 @@ do_install() {
 }
 
 # ==========================================
+# SHELL INTEGRATION HOOK
+# ==========================================
+do_shell_hook() {
+    cat << 'EOF'
+mpm() {
+    if [ "$1" = "activate" ]; then
+        shift
+        local target_env="$1"
+        local env_path=""
+
+        if [ -n "$target_env" ]; then
+            env_path="$HOME/.local/share/mpm/environments/$target_env"
+        elif [ -d "./.mpm" ]; then
+            env_path="$(pwd)/.mpm"
+        else
+            echo "Error: No .mpm environment found in current directory." >&2
+            return 1
+        fi
+
+        if [ -f "$env_path/activate" ]; then
+            source "$env_path/activate"
+        else
+            echo "Error: Activation script not found at $env_path/activate" >&2
+            return 1
+        fi
+    elif [ "$1" = "deactivate" ]; then
+        if type deactivate >/dev/null 2>&1; then
+            deactivate
+        else
+            echo "Error: No active mpm environment to deactivate." >&2
+            return 1
+        fi
+    else
+        command mpm "$@"
+    fi
+}
+EOF
+}
+
+# ==========================================
 # 3. RUN SUBCOMMAND (Fix 3: Robust execution)
 # ==========================================
 do_run() {
@@ -481,6 +521,8 @@ COMMAND="$1"
 shift || true
 
 case "$COMMAND" in
+    ...
+    shell-hook) do_shell_hook ;;
     init)     do_init ;;
     update)   do_update ;;
     search)   do_search "$1" ;;

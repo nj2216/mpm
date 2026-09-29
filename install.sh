@@ -34,6 +34,15 @@ add_path() {
 add_path "$HOME/.bashrc"
 add_path "$HOME/.zshrc"
 
+# Add shell integration to ~/.bashrc or ~/.zshrc
+if ! grep -q "mpm shell-hook" ~/.bashrc 2>/dev/null; then
+    echo 'eval "$(mpm shell-hook)"' >> ~/.bashrc
+fi
+
+if [ -f ~/.zshrc ] && ! grep -q "mpm shell-hook" ~/.zshrc 2>/dev/null; then
+    echo 'eval "$(mpm shell-hook)"' >> ~/.zshrc
+fi
+
 echo -e "\033[32m✔ Installation complete!\033[0m"
 echo ""
 echo "To get started:"
