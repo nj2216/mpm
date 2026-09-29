@@ -105,6 +105,11 @@ deactivate () {
     fi
 }
 
+# If already in an active environment, deactivate it first to prevent prompt stacking
+if [ -n "${MPM_ACTIVE_PREFIX:-}" ]; then
+    deactivate
+fi
+
 _OLD_MPM_PATH="$PATH"
 _OLD_MPM_LD_PATH="${LD_LIBRARY_PATH:-}"
 _OLD_MPM_PS1="${PS1:-}"
@@ -112,14 +117,16 @@ _OLD_MPM_PS1="${PS1:-}"
 ENV_BASE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export MPM_ACTIVE_PREFIX="$ENV_BASE"
 
+# Auto-discover all library folders inside this isolated environment
 RAW_LIBS=$(find "$ENV_BASE" -type d \( -name "lib" -o -name "*linux-gnu" \) 2>/dev/null | tr '\n' ':')
 CLEAN_LIBS="${RAW_LIBS%:}"
 
 if [ -n "$CLEAN_LIBS" ]; then
     export LD_LIBRARY_PATH="${CLEAN_LIBS}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 fi
-export PATH="$ENV_BASE/bin:$ENV_BASE/usr/bin:$PATH"
+export PATH="$ENV_BASE/bin:$ENV_BASE/usr/bin:$ENV_BASE/usr/games:$PATH"
 
+# Cleanly prepend prompt indicator without stacking
 PS1="($(basename "$ENV_BASE")) ${PS1:-}"
 export PS1
 EOF
@@ -362,10 +369,12 @@ do_install() {
         dpkg -x "$deb_path" "$PREFIX"
     done
 
-    for search_dir in "$PREFIX/usr/bin" "$PREFIX/usr/games"; do
+    # Symlink binaries inside this environment's bin/
+    mkdir -p "$PREFIX/bin"
+    for search_dir in "$PREFIX/usr/bin" "$PREFIX/usr/games" "$PREFIX/usr/sbin"; do
         [ -d "$search_dir" ] || continue
         for bin in "$search_dir"/*; do
-            [ -x "$bin" ] && [ ! -d "$bin" ] || continue
+            [ -f "$bin" ] && [ -x "$bin" ] || continue
             local bname
             bname=$(basename "$bin")
             ln -sf "$bin" "$PREFIX/bin/$bname"
