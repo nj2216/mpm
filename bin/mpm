@@ -6,7 +6,7 @@
 
 set -e
 
-VERSION="2.1.0"
+VERSION="2.2.0"
 REPO_OWNER="nj2216"
 REPO_NAME="mpm"
 REPO_URL="https://raw.githubusercontent.com/$REPO_OWNER/$REPO_NAME/main/bin/mpm"
@@ -405,9 +405,20 @@ do_install() {
 
     if command -v patchelf &>/dev/null; then
         log_verbose "Patching environment RPATHs with patchelf..."
-        local rpath="\$ORIGIN/../lib:\$ORIGIN/../lib/x86_64-linux-gnu:\$ORIGIN/../../usr/lib:\$ORIGIN/../../usr/lib/x86_64-linux-gnu"
         
+        # 1. Discover all directories that actually contain .so libraries inside this environment
+        local all_lib_dirs=()
+        while IFS= read -r dir; do
+            [ -n "$dir" ] && all_lib_dirs+=("$dir")
+        done < <(find "$PREFIX" -type f -name "*.so*" -exec dirname {} + 2>/dev/null | sort -u)
+
+        # 2. Build complete relative and absolute RPATH list
+        local extra_rpaths
+        extra_rpaths=$(IFS=":"; echo "${all_lib_dirs[*]}")
+        local rpath="\$ORIGIN/../lib:\$ORIGIN/../lib/x86_64-linux-gnu:\$ORIGIN/../usr/lib:\$ORIGIN/../usr/lib/x86_64-linux-gnu:\$ORIGIN/../../usr/lib:\$ORIGIN/../../usr/lib/x86_64-linux-gnu:${extra_rpaths}"
+
         set +e
+        # Patch all executables
         for elf in "$PREFIX"/bin/* "$PREFIX"/usr/bin/*; do
             if [ -f "$elf" ] && [ ! -h "$elf" ]; then
                 if head -c 4 "$elf" 2>/dev/null | grep -q $'\x7fELF'; then
@@ -415,8 +426,9 @@ do_install() {
                 fi
             fi
         done
-        
-        for lib in "$PREFIX"/lib/x86_64-linux-gnu/*.so* "$PREFIX"/usr/lib/x86_64-linux-gnu/*.so*; do
+
+        # Patch all shared libraries so nested ones can find siblings
+        for lib in "$PREFIX"/lib/x86_64-linux-gnu/*.so* "$PREFIX"/usr/lib/x86_64-linux-gnu/*.so* "$PREFIX"/usr/lib/x86_64-linux-gnu/pulseaudio/*.so*; do
             if [ -f "$lib" ] && [ ! -h "$lib" ]; then
                 if head -c 4 "$lib" 2>/dev/null | grep -q $'\x7fELF'; then
                     patchelf --set-rpath "\$ORIGIN:\$ORIGIN/..:$rpath" "$lib" 2>/dev/null
@@ -449,9 +461,10 @@ do_run() {
         exit 1
     fi
 
-    local raw_libs
-    raw_libs=$(find "$PREFIX" -type d \( -name "lib" -o -name "*linux-gnu" \) 2>/dev/null | tr '\n' ':')
-    local clean_libs="${raw_libs%:}"
+    # Discover all directories with libraries (including nested like pulseaudio)
+    local all_libs
+    all_libs=$(find "$PREFIX" -type f -name "*.so*" -exec dirname {} + 2>/dev/null | sort -u | tr '\n' ':')
+    local clean_libs="${all_libs%:}"
 
     exec env \
         PATH="$PREFIX/bin:$PREFIX/usr/bin:$PATH" \

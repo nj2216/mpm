@@ -122,23 +122,32 @@ else
 fi
 
 # ------------------------------------------------------------------------------
-# TEST 5: Interactive Shell Activation & Deactivation
+# TEST 5: Environment Shell Hooks (source .mpm/activate & deactivate)
 # ------------------------------------------------------------------------------
 info "Test 5: Environment Shell Hooks (source .mpm/activate & deactivate)"
 cd "$PROJECT_A"
 
-# Run a subshell to test source activation and deactivate behavior
+# Verify that activation points to .mpm and deactivation restores host state
+BEFORE_ACTIVATE=$(which jq 2>/dev/null || echo "NONE")
+
 ACTIVATE_TEST=$(bash -c '
+    BEFORE="'"$BEFORE_ACTIVATE"'"
     source "'"$PROJECT_A"'/.mpm/activate"
-    which jq
+    ACTIVE_JQ=$(which jq)
     deactivate
-    which jq 2>/dev/null || echo "DEACTIVATED_CLEAN"
+    AFTER_JQ=$(which jq 2>/dev/null || echo "NONE")
+    
+    if [ "$ACTIVE_JQ" = "'"$PROJECT_A"'/.mpm/bin/jq" ] && [ "$AFTER_JQ" = "$BEFORE" ]; then
+        echo "CLEAN_HOOK_SUCCESS"
+    else
+        echo "FAILED: Active was $ACTIVE_JQ, Restored was $AFTER_JQ"
+    fi
 ')
 
-if echo "$ACTIVATE_TEST" | grep -q "$PROJECT_A/.mpm/bin/jq" && echo "$ACTIVATE_TEST" | grep -q "DEACTIVATED_CLEAN"; then
+if echo "$ACTIVATE_TEST" | grep -q "CLEAN_HOOK_SUCCESS"; then
     pass "Virtualenv-style activation and clean deactivation verified."
 else
-    fail "Activation/deactivation failed. Output: $ACTIVATE_TEST"
+    fail "Activation/deactivation test: $ACTIVATE_TEST"
 fi
 
 # ------------------------------------------------------------------------------
@@ -170,7 +179,7 @@ PROJECT_B="$SANDBOX_DIR/project_b"
 mkdir -p "$PROJECT_B" && cd "$PROJECT_B"
 
 if "$MPM_BIN" install ffmpeg >/dev/null 2>&1; then
-    FFMPEG_OUT=$("$MPM_BIN" run ffmpeg -version 2>/dev/null | head -n 1 || true)
+    FFMPEG_OUT=$("$MPM_BIN" run ffmpeg -version 2>&1 | head -n 2 || true)
     if echo "$FFMPEG_OUT" | grep -q "ffmpeg version"; then
         pass "Complex binary with 20+ shared libraries linked without error ($FFMPEG_OUT)."
     else
