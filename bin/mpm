@@ -105,7 +105,7 @@ deactivate () {
     fi
 }
 
-# If already in an active environment, deactivate it first to prevent prompt stacking
+# If already in an active environment, deactivate it first
 if [ -n "${MPM_ACTIVE_PREFIX:-}" ]; then
     deactivate
 fi
@@ -114,10 +114,11 @@ _OLD_MPM_PATH="$PATH"
 _OLD_MPM_LD_PATH="${LD_LIBRARY_PATH:-}"
 _OLD_MPM_PS1="${PS1:-}"
 
-ENV_BASE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# The environment root is the folder containing this activate script (.mpm)
+ENV_BASE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export MPM_ACTIVE_PREFIX="$ENV_BASE"
 
-# Auto-discover all library folders inside this isolated environment
+# Auto-discover all library folders inside .mpm
 RAW_LIBS=$(find "$ENV_BASE" -type d \( -name "lib" -o -name "*linux-gnu" \) 2>/dev/null | tr '\n' ':')
 CLEAN_LIBS="${RAW_LIBS%:}"
 
@@ -126,8 +127,9 @@ if [ -n "$CLEAN_LIBS" ]; then
 fi
 export PATH="$ENV_BASE/bin:$ENV_BASE/usr/bin:$ENV_BASE/usr/games:$PATH"
 
-# Cleanly prepend prompt indicator without stacking
-PS1="($(basename "$ENV_BASE")) ${PS1:-}"
+# Parent folder name for a clean prompt, e.g. (tmpm)
+PROJECT_NAME="$(basename "$(cd "$ENV_BASE/.." && pwd)")"
+PS1="($PROJECT_NAME) ${PS1:-}"
 export PS1
 EOF
     chmod +x "$prefix/activate"
