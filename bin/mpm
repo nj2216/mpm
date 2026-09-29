@@ -521,7 +521,6 @@ COMMAND="$1"
 shift || true
 
 case "$COMMAND" in
-    ...
     shell-hook) do_shell_hook ;;
     init)     do_init ;;
     update)   do_update ;;
