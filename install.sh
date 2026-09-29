@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-REPO="https://raw.githubusercontent.com/<YOUR-GITHUB-USERNAME>/mpm/main"
+REPO="https://raw.githubusercontent.com/nj2216/mpm/main"
 BIN_DIR="$HOME/.local/bin"
 
 echo -e "\033[1;36m==>\033[0m Installing \033[1mmpm\033[0m (Modern Package Manager)..."

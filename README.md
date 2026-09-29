@@ -1,124 +1,173 @@
-# ⚡ MPM (Modern Package Manager)
+# MPM (Modern Package Manager)
 
-A rootless, parallel, user-space package manager for Debian/Ubuntu environments inspired by `uv`.
+MPM is a lightweight, rootless user-space package manager for Debian and Ubuntu systems. It allows you to download and extract standard `.deb` packages into isolated, project-local environments—much like Python's `venv` or Conda, but for system binaries and libraries.
 
-- 🚀 **Zero sudo required**: Install standard apt packages into `~/.local`.
-- ⚡ **Blazing Fast**: Multi-threaded parallel downloads with an interactive terminal UI.
-- 📦 **Isolated Profiles**: Create throwaway virtual environments like Conda (`mpm env create myenv`).
-- 🔧 **ELF Auto-Patching**: Automatically runs `patchelf` to fix dynamic runpaths and shared libraries.
-- 🧹 **Clean Removal**: SQLite tracking engine cleanly tracks and deletes uninstalled files.
+Downloads are fetched in parallel with an active terminal progress display inspired by Astral's `uv`. No `sudo` access is needed, and no changes are made to your system root, `~/.local`, or shell startup scripts (`~/.bashrc`).
 
-## 📦 Installation
+<!-- SCREENSHOT / DEMO GIF PLACEHOLDER -->
+<!-- Replace the URL below with a recording of mpm in action (e.g., using VHS or asciinema) -->
+<p align="center">
+  <img src="imgs/he" alt="MPM Terminal Demo" width="750" />
+</p>
+
+---
+
+## Key Highlights
+
+- **Complete Isolation**: Packages install into a local `./.mpm` directory (or a named global profile). It leaves your underlying system, terminal environment variables, and `~/.bashrc` untouched.
+- **Parallel Fetching**: Replaces sequential downloads with a multi-threaded parallel downloader that tracks transfer speeds, package totals, and progress bars.
+- **No Administrative Rights Required**: Useful on managed servers, university computing clusters, restricted containers, and CI pipelines where you do not have root access.
+- **Safe Runpath Handling**: Applies `$ORIGIN`-relative runpaths using `patchelf` so binaries find their shared libraries without contaminating host tools.
+- **Straightforward Activation**: Run commands on-the-fly using `mpm run <cmd>`, or source the environment's `bin/activate` script to drop into a dedicated shell session.
+
+---
+
+## Installation
+
+You can install `mpm` by cloning the repository or running the bootstrap script:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/<YOUR-GITHUB-USERNAME>/mpm/main/install.sh | bash
 ```
 
-## 🚀 Quickstart
+Make sure `~/.local/bin` is present in your `$PATH`.
+
+Alternatively, copy `bin/mpm` directly into any directory on your `$PATH` and ensure it is marked executable:
 
 ```bash
-# Update repository indices
+git clone https://github.com/<YOUR-GITHUB-USERNAME>/mpm.git
+cd mpm
+chmod +x bin/mpm
+cp bin/mpm ~/.local/bin/
+```
+
+---
+
+## Usage
+
+### 1. Synchronize Package Lists
+
+Before installing packages, fetch and update the remote indices:
+
+```bash
 mpm update
-
-# Search for packages
-mpm search ripgrep
-
-# Install a package (runs parallel download + patchelf)
-mpm install ripgrep
-
-# List your installed user packages
-mpm list
-
-# Remove a package cleanly
-mpm remove ripgrep
 ```
 
-## 🧪 Isolated Environments
+<!-- SCREENSHOT PLACEHOLDER: MPM UPDATE -->
+<!-- <p align="center"><img src="docs/screenshots/update.png" alt="mpm update output" width="650" /></p> -->
+
+### 2. Working in a Project Directory (Default)
+
+Running `install` inside any directory automatically creates a `./.mpm` environment right where you are:
 
 ```bash
-# Create an environment
-mpm env create dev-env
+# Search for packages across Ubuntu pockets
+mpm search ffmpeg
 
-# Install into that environment only
-mpm -n dev-env install python3-pip
+# Install ffmpeg and all required dependencies locally
+mpm install ffmpeg
+```
 
-# Run a command inside the environment
-mpm run dev-env python3 --version
+<!-- SCREENSHOT PLACEHOLDER: MPM INSTALL (UV PROGRESS) -->
+<!-- <p align="center"><img src="docs/screenshots/install.png" alt="mpm parallel download" width="650" /></p> -->
 
-# Or activate it in your shell
-source ~/.local/share/mpm/environments/dev-env/activate
+Once installed, use the binary directly with `mpm run`:
+
+```bash
+mpm run ffmpeg -version
+```
+
+Or activate the environment in your current shell:
+
+```bash
+source .mpm/activate
+
+# Now ffmpeg is directly in your PATH
+ffmpeg -version
+
+# Return to your standard shell
+deactivate
+```
+
+### 3. Named Global Environments
+
+You can also create named profiles stored in `~/.local/share/mpm/environments/` by passing the `-n` or `--env` flag:
+
+```bash
+# Install packages into a shared environment called "tools"
+mpm -n tools install ripgrep jq
+
+# Run an executable directly from the named profile
+mpm -n tools run ripgrep --version
+
+# Or activate it
+source ~/.local/share/mpm/environments/tools/activate
+jq --version
+deactivate
 ```
 
 ---
 
-## 💡 How It Works Under the Hood
-
-Unlike traditional package managers that demand root access to mutate `/usr`, `mpm` creates a completely unprivileged user-space overlay:
-1. **Resolution**: Directs `apt-get` to read from an unprivileged status file and custom package lists using non-root configurations.
-2. **Parallel Downloader**: Uses a multi-threaded Python engine with non-blocking I/O to fetch `.deb` archives simultaneously.
-3. **Database Tracking**: Analyzes the contents of each `.deb` using a local SQLite engine (`~/.local_apt/mpm_db.sqlite`) before unpacking, keeping an audit trail of file ownership to ensure clean uninstalls.
-4. **Binary Patching**: Fixes hardcoded Linux library paths (`RPATH` and `RUNPATH`) on extracted ELF binaries so they can find their dynamic libraries inside `~/.local/lib` without system-wide library pollution.
-
----
-
-## 🤝 Acknowledgements & Prior Art
-
-`mpm` was inspired by and built on top of brilliant tools across the Linux, Python, and systems engineering ecosystems:
-
-- **[Astral / uv](https://github.com/astral-sh/uv)** — The design benchmark for fast package managers. The UI spinner, active download bars, and responsive terminal feedback in `mpm` are directly modeled after `uv`'s terminal aesthetics.
-- **[Debian APT & dpkg](https://wiki.debian.org/Teams/Apt)** — For establishing one of the most reliable dependency management databases and packaging standards in computing history.
-- **[Nix](https://nixos.org/) & [Homebrew](https://brew.sh/)** — For pioneering the philosophy of user-owned package installations without needing `sudo` or modifying the host root partition.
-- **[patchelf (NixOS)](https://github.com/NixOS/patchelf)** — An indispensable utility that makes self-contained ELF executable relocation and dynamic linker rewriting possible on modern Linux systems.
-- **[Conda](https://docs.conda.io/)** — For the intuition behind prefix-based isolated environments (`mpm env create`).
-
----
-
-## 🛠️ Requirements & Compatibility
-
-- **OS**: Ubuntu (20.04 LTS, 22.04 LTS, 24.04 LTS) and modern Debian-based distributions.
-- **Dependencies**: 
-  - Standard utilities: `bash`, `python3` (3.7+), `dpkg`, `apt`, `wget` (or `curl`).
-  - *Optional (recommended)*: `patchelf` (can be installed rootlessly via `mpm install patchelf`).
-- **Permissions**: **Zero root / sudo required**. Works seamlessly on shared HPC clusters, university lab machines, and restricted CI runners.
-
----
-
-## 🤝 Contributing
-
-Contributions, issues, and feature requests are welcome!
-
-1. Fork the Project
-2. Create your Feature Branch (`git checkout -b feature/AmazingFeature`)
-3. Commit your Changes (`git commit -m 'Add some AmazingFeature'`)
-4. Push to the Branch (`git push origin feature/AmazingFeature`)
-5. Open a Pull Request
-
----
-
-## 📄 License
-
-Distributed under the **MIT License**. See [`LICENSE`](LICENSE) for more information.
+## CLI Reference
 
 ```text
-MIT License
+Usage: mpm [-v|--verbose] [-n <env-name>] <command> [arguments]
 
-Copyright (c) 2025 Jeevan N
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+Commands:
+  update                  Download and update repository indices
+  search <query>          Search package catalogs for matching terms
+  install <package>       Resolve, fetch, and extract packages into the environment
+  run <cmd> [args...]     Execute a command with the environment paths loaded
+  init                    Generate an empty environment scaffold in ./.mpm
+  clean                   Clear downloaded .deb archives from the cache directory
 ```
+
+---
+
+## Technical Details
+
+Traditional package managers expect write access to root directories such as `/usr`, `/lib`, and `/etc`. MPM approaches user installations through non-root mechanisms:
+
+1. **Resolution**: Directs `/usr/bin/apt-get` to evaluate dependencies against a local, isolated status file and custom package indices, keeping your system's package database clean.
+2. **Parallel Retrieval**: Download tasks are queued across a multi-threaded pool with dynamic ANSI cursor rendering to display live throughput and completion statistics.
+3. **Prefix Extraction**: Packages are unpacked strictly within the environment folder.
+4. **Relocation & RPATH**: If `patchelf` is present on the host, MPM embeds `$ORIGIN`-relative runpaths into compiled ELF binaries and libraries. This ensures dependencies resolve from the local folder first without requiring a globally exported `LD_LIBRARY_PATH`.
+5. **Session Scoping**: The generated `activate` script preserves original environment variables (`PATH`, `PS1`, `LD_LIBRARY_PATH`) so exiting with `deactivate` restores your shell to its original state.
+
+---
+
+## Requirements
+
+- **Operating System**: Modern Debian or Ubuntu installations (tested on 20.04 LTS, 22.04 LTS, 24.04 LTS, and 26.04).
+- **Core Dependencies**: Standard utilities available on most base images: `bash`, `python3` (3.7+), `dpkg`, `apt`, `wget` (or `curl`).
+- **Optional**: `patchelf` (recommended for dynamic runpath rewriting).
+
+---
+
+## Acknowledgements
+
+MPM draws ideas and design patterns from tools across the open source community:
+
+- **Astral uv**: The progress indicators and visual layout for parallel transfers were modeled after the responsive user experience found in `uv`.
+- **Debian APT & dpkg**: The dependency solver, archive structure, and metadata standards established by Debian.
+- **Python venv**: The design for prefix scoping, path overrides, and activation/deactivation routines.
+- **Nix and Homebrew**: Inspiration for non-root prefix isolation and relocatable builds.
+- **NixOS patchelf**: The utility enabling binary relocation on Linux systems.
+
+---
+
+## Contributing
+
+Contributions and bug reports are welcome:
+
+1. Fork the repository.
+2. Create a dedicated topic branch (`git checkout -b feature/my-feature`).
+3. Commit your changes (`git commit -m 'Add support for custom mirrors'`).
+4. Push to the branch (`git push origin feature/my-feature`).
+5. Open a Pull Request.
+
+---
+
+## License
+
+This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
