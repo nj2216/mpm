@@ -92,7 +92,7 @@ deactivate () {
         export LD_LIBRARY_PATH
         unset _OLD_MPM_LD_PATH
     else
-        unset LD_LIBRARY_PATH
+        unset LD_LIBRARY_PATH 2>/dev/null || true
     fi
     if [ -n "${_OLD_MPM_PS1:-}" ]; then
         PS1="${_OLD_MPM_PS1:-}"
@@ -101,7 +101,7 @@ deactivate () {
     fi
     unset MPM_ACTIVE_PREFIX
     if [ -n "${BASH:-}" -o -n "${ZSH_VERSION:-}" ]; then
-        hash -r 2>/dev/null
+        hash -r 2>/dev/null || true
     fi
 }
 
@@ -113,13 +113,18 @@ ENV_BASE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export MPM_ACTIVE_PREFIX="$ENV_BASE"
 
 # Auto-discover all library folders inside this isolated environment
-LOCAL_LIBS=$(find "$ENV_BASE" -type d \( -name "lib" -o -name "*linux-gnu" \) 2>/dev/null | tr '\n' ':')
-export LD_LIBRARY_PATH="${LOCAL_LIBS}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+RAW_LIBS=$(find "$ENV_BASE" -type d \( -name "lib" -o -name "*linux-gnu" \) 2>/dev/null | tr '\n' ':')
+CLEAN_LIBS="${RAW_LIBS%:}"
+
+if [ -n "$CLEAN_LIBS" ]; then
+    export LD_LIBRARY_PATH="${CLEAN_LIBS}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+fi
 export PATH="$ENV_BASE/bin:$ENV_BASE/usr/bin:$PATH"
 
 PS1="($(basename "$ENV_BASE")) ${PS1:-}"
 export PS1
 EOF
+    chmod +x "$prefix/activate"
 }
 
 # ==========================================
@@ -284,7 +289,6 @@ do_update() {
     echo "Updating indices for [$CODENAME] ($ARCH) via wget..."
     > "$SOURCES_LIST"
 
-    # FIX 1: Added restricted and multiverse to prevent broken solver trees
     POCKETS=("$CODENAME" "${CODENAME}-updates" "${CODENAME}-security")
     COMPONENTS=("main" "universe" "restricted" "multiverse")
     PREFIX="archive.ubuntu.com_ubuntu_dists"
@@ -330,7 +334,6 @@ do_install() {
     log_verbose "Target prefix: $PREFIX"
 
     set +e
-    # FIX 2: Added --no-install-recommends to avoid conflicting extra packages
     RAW_OUTPUT=$(/usr/bin/apt-get "${APT_OPTS[@]}" install --reinstall --no-install-recommends --print-uris -qq "$PACKAGE" 2>&1)
     APT_CODE=$?
     set -e
@@ -371,28 +374,28 @@ do_install() {
         done
     done
 
-    # FIX 3: Patch both binaries AND shared libraries so they find each other via $ORIGIN
+    # Safe patchelf RPATH embedding (Fix 1: robust error handling)
     if command -v patchelf &>/dev/null; then
         log_verbose "Patching environment RPATHs with patchelf..."
         local rpath="\$ORIGIN/../lib:\$ORIGIN/../lib/x86_64-linux-gnu:\$ORIGIN/../../usr/lib:\$ORIGIN/../../usr/lib/x86_64-linux-gnu"
         
-        # Patch binaries
+        set +e
         for elf in "$PREFIX"/bin/* "$PREFIX"/usr/bin/*; do
             if [ -f "$elf" ] && [ ! -h "$elf" ]; then
                 if head -c 4 "$elf" 2>/dev/null | grep -q $'\x7fELF'; then
-                    patchelf --set-rpath "$rpath" "$elf" 2>/dev/null || true
+                    patchelf --set-rpath "$rpath" "$elf" 2>/dev/null
                 fi
             fi
         done
         
-        # Patch libraries
         for lib in "$PREFIX"/lib/x86_64-linux-gnu/*.so* "$PREFIX"/usr/lib/x86_64-linux-gnu/*.so*; do
             if [ -f "$lib" ] && [ ! -h "$lib" ]; then
                 if head -c 4 "$lib" 2>/dev/null | grep -q $'\x7fELF'; then
-                    patchelf --set-rpath "\$ORIGIN:\$ORIGIN/..:$rpath" "$lib" 2>/dev/null || true
+                    patchelf --set-rpath "\$ORIGIN:\$ORIGIN/..:$rpath" "$lib" 2>/dev/null
                 fi
             fi
         done
+        set -e
     fi
 
     # Refresh activate script with newly installed library subfolders
@@ -408,7 +411,7 @@ do_install() {
 }
 
 # ==========================================
-# 3. RUN SUBCOMMAND
+# 3. RUN SUBCOMMAND (Fix 3: Robust execution)
 # ==========================================
 do_run() {
     local PREFIX
@@ -419,14 +422,15 @@ do_run() {
         exit 1
     fi
 
-    # Dynamic library path lookup for one-off commands
-    local local_libs
-    local_libs=$(find "$PREFIX" -type d \( -name "lib" -o -name "*linux-gnu" \) 2>/dev/null | tr '\n' ':')
+    local raw_libs
+    raw_libs=$(find "$PREFIX" -type d \( -name "lib" -o -name "*linux-gnu" \) 2>/dev/null | tr '\n' ':')
+    local clean_libs="${raw_libs%:}"
 
-    PATH="$PREFIX/bin:$PREFIX/usr/bin:$PATH" \
-    LD_LIBRARY_PATH="${local_libs}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
-    PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig:$PREFIX/usr/lib/pkgconfig:$PKG_CONFIG_PATH" \
-    "$@"
+    exec env \
+        PATH="$PREFIX/bin:$PREFIX/usr/bin:$PATH" \
+        LD_LIBRARY_PATH="${clean_libs}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+        PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig:$PREFIX/usr/lib/pkgconfig:${PKG_CONFIG_PATH:-}" \
+        "$@"
 }
 
 # ==========================================
@@ -444,7 +448,6 @@ do_search() {
 # 5. ENV / INIT SUBCOMMANDS
 # ==========================================
 do_init() {
-    # FIX 4: Respects -n <env> or defaults to current directory's .mpm/
     local PREFIX
     PREFIX="$(get_target_prefix)"
     setup_environment_scaffold "$PREFIX"
