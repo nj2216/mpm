@@ -1,0 +1,678 @@
+#!/bin/bash
+# ==============================================================================
+# MPM (Modern Package Manager)
+# Rootless, Parallel, Isolated, UV-style APT User-space Package Manager
+# ==============================================================================
+
+set -e
+
+# --- System Paths & Environments ---
+MPM_ROOT="${MPM_ROOT:-$HOME/.local_apt}"
+DEFAULT_INSTALL_DIR="$HOME/.local"
+CACHE_DIR="$HOME/.cache/mpm/archives"
+DB_FILE="$MPM_ROOT/mpm_db.sqlite"
+
+APT_STATE="$MPM_ROOT/lists"
+APT_CACHE="$MPM_ROOT/cache"
+APT_ETC="$MPM_ROOT/etc"
+SOURCES_LIST="$APT_ETC/sources.list"
+SOURCES_D="$APT_ETC/sources.list.d"
+KEYRINGS_DIR="$APT_ETC/keyrings"
+ENVS_DIR="$HOME/.local/share/mpm/environments"
+
+ARCH=$(dpkg --print-architecture 2>/dev/null || echo "amd64")
+DETECTED_CODENAME=$(lsb_release -cs 2>/dev/null || grep UBUNTU_CODENAME /etc/os-release 2>/dev/null | cut -d= -f2)
+if [ "$DETECTED_CODENAME" = "resolute" ] || [ -z "$DETECTED_CODENAME" ]; then
+    CODENAME="noble"
+else
+    CODENAME="$DETECTED_CODENAME"
+fi
+
+MIRROR="http://archive.ubuntu.com/ubuntu"
+
+# Resolve active target installation directory (Profile / Virtual Env support)
+ACTIVE_ENV=""
+if [ -n "$MPM_ACTIVE_ENV" ]; then
+    ACTIVE_ENV="$MPM_ACTIVE_ENV"
+fi
+
+get_install_dir() {
+    if [ -n "$TARGET_ENV" ]; then
+        echo "$ENVS_DIR/$TARGET_ENV"
+    elif [ -n "$ACTIVE_ENV" ]; then
+        echo "$ENVS_DIR/$ACTIVE_ENV"
+    else
+        echo "$DEFAULT_INSTALL_DIR"
+    fi
+}
+
+# ==============================================================================
+# INITIALIZATION & DATABASE
+# ==============================================================================
+init_env() {
+    mkdir -p "$APT_STATE/partial" \
+             "$APT_CACHE/archives/partial" \
+             "$APT_ETC" \
+             "$SOURCES_D" \
+             "$KEYRINGS_DIR" \
+             "$CACHE_DIR" \
+             "$ENVS_DIR" \
+             "$(get_install_dir)/bin"
+
+    if [ -f /var/lib/dpkg/status ]; then
+        STATUS_FILE="/var/lib/dpkg/status"
+    else
+        STATUS_FILE="$MPM_ROOT/status"
+        touch "$STATUS_FILE"
+    fi
+
+    if [ ! -f "$SOURCES_LIST" ]; then
+        cat <<EOF > "$SOURCES_LIST"
+deb $MIRROR $CODENAME main universe restricted multiverse
+deb $MIRROR ${CODENAME}-updates main universe restricted multiverse
+deb $MIRROR ${CODENAME}-security main universe restricted multiverse
+EOF
+    fi
+
+    init_sqlite_db
+}
+
+init_sqlite_db() {
+    python3 - "$DB_FILE" << 'EOF'
+import sqlite3, sys
+db = sqlite3.connect(sys.argv[1])
+c = db.cursor()
+c.execute('''
+    CREATE TABLE IF NOT EXISTS installed_packages (
+        name TEXT,
+        version TEXT,
+        install_prefix TEXT,
+        installed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (name, install_prefix)
+    )
+''')
+c.execute('''
+    CREATE TABLE IF NOT EXISTS owned_files (
+        path TEXT,
+        package_name TEXT,
+        install_prefix TEXT,
+        PRIMARY KEY (path, install_prefix)
+    )
+''')
+db.commit()
+db.close()
+EOF
+}
+
+get_apt_opts() {
+    APT_OPTS=(
+        -o Dir::State::Lists="$APT_STATE"
+        -o Dir::State::status="$STATUS_FILE"
+        -o Dir::Cache="$APT_CACHE"
+        -o Dir::Cache::archives="$APT_CACHE/archives"
+        -o Dir::Etc::sourcelist="$SOURCES_LIST"
+        -o Dir::Etc::sourceparts="$SOURCES_D"
+    )
+}
+
+ensure_bashrc() {
+    local BASHRC="$HOME/.bashrc"
+    local MARKER="# Added by MPM"
+    if ! grep -q "$MARKER" "$BASHRC" 2>/dev/null; then
+        cat << 'EOF' >> "$BASHRC"
+
+# Added by MPM (Modern Package Manager)
+export PATH="$HOME/.local/bin:$PATH"
+export LD_LIBRARY_PATH="$HOME/.local/lib:$HOME/.local/lib/x86_64-linux-gnu:$HOME/.local/usr/lib:$HOME/.local/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH"
+export MANPATH="$HOME/.local/share/man:$HOME/.local/usr/share/man:$MANPATH"
+export PKG_CONFIG_PATH="$HOME/.local/lib/pkgconfig:$HOME/.local/lib/x86_64-linux-gnu/pkgconfig:$HOME/.local/usr/lib/pkgconfig:$PKG_CONFIG_PATH"
+export XDG_DATA_DIRS="$HOME/.local/share:$HOME/.local/usr/share:$XDG_DATA_DIRS"
+EOF
+    fi
+}
+
+# ==============================================================================
+# FEATURE 1: ELF RPATH PATCHER (patchelf bootstrapper)
+# ==============================================================================
+patch_elf_binaries() {
+    local target_prefix="$1"
+    
+    # Try system patchelf first, then check local installation
+    local PATCHELF_BIN="patchelf"
+    if ! command -v patchelf &>/dev/null; then
+        if [ -x "$DEFAULT_INSTALL_DIR/bin/patchelf" ]; then
+            PATCHELF_BIN="$DEFAULT_INSTALL_DIR/bin/patchelf"
+        elif [ -x "$DEFAULT_INSTALL_DIR/usr/bin/patchelf" ]; then
+            PATCHELF_BIN="$DEFAULT_INSTALL_DIR/usr/bin/patchelf"
+        else
+            return 0 # Silently skip if patchelf cannot be obtained
+        fi
+    fi
+
+    local libdir="$target_prefix/lib:$target_prefix/lib/x86_64-linux-gnu:$target_prefix/usr/lib:$target_prefix/usr/lib/x86_64-linux-gnu"
+    
+    # Find all ELF dynamic binaries/libraries and update their RUNPATH
+    while IFS= read -r file; do
+        if [ -f "$file" ] && [ ! -h "$file" ]; then
+            if head -c 4 "$file" 2>/dev/null | grep -q $'\x7fELF'; then
+                "$PATCHELF_BIN" --set-rpath "$libdir" "$file" 2>/dev/null || true
+            fi
+        fi
+    done < <(find "$target_prefix" -type f \( -path "*/bin/*" -o -path "*/lib/*" \))
+}
+
+# ==============================================================================
+# FEATURE 5: SYMLINK FLATTENER
+# ==============================================================================
+flatten_symlinks() {
+    local target_prefix="$1"
+    local bin_target="$target_prefix/bin"
+    mkdir -p "$bin_target"
+
+    for search_dir in "$target_prefix/usr/bin" "$target_prefix/usr/games"; do
+        if [ -d "$search_dir" ]; then
+            for bin in "$search_dir"/*; do
+                if [ -x "$bin" ] && [ ! -d "$bin" ]; then
+                    local base_name
+                    base_name=$(basename "$bin")
+                    ln -sf "$bin" "$bin_target/$base_name"
+                fi
+            done
+        fi
+    done
+}
+
+# ==============================================================================
+# UV-STYLE PARALLEL ASYNC ENGINE
+# ==============================================================================
+parallel_download() {
+    local target_cache="$1"
+    shift
+    local urls=("$@")
+
+    python3 - "${target_cache}" "${urls[@]}" << 'EOF'
+import sys, os, time, threading
+from urllib.request import urlopen, Request
+
+cache_dir = sys.argv[1]
+urls = sys.argv[2:]
+
+total_files = len(urls)
+completed_files = 0
+lock = threading.Lock()
+
+tasks = {}
+for u in urls:
+    fname = os.path.basename(u.split('?')[0])
+    pkg_name = fname.split('_')[0] if '_' in fname else fname
+    cached = os.path.exists(os.path.join(cache_dir, fname))
+    tasks[u] = {
+        'name': pkg_name[:22],
+        'file': fname,
+        'downloaded': 0,
+        'total': 0,
+        'done': cached,
+        'cached': cached,
+        'active': False
+    }
+    if cached:
+        completed_files += 1
+
+def human_bytes(b):
+    if b <= 0: return "  0.00   B"
+    units = ["B", "KiB", "MiB", "GiB"]
+    idx = 0
+    val = float(b)
+    while val >= 1024.0 and idx < len(units) - 1:
+        val /= 1024.0
+        idx += 1
+    return f"{val:6.2f} {units[idx]}"
+
+def worker(url):
+    global completed_files
+    if tasks[url]['done']:
+        return
+
+    out_path = os.path.join(cache_dir, tasks[url]['file'])
+    part_path = out_path + ".part"
+
+    with lock:
+        tasks[url]['active'] = True
+
+    try:
+        req = Request(url, headers={'User-Agent': 'mpm/2.0'})
+        with urlopen(req, timeout=30) as resp, open(part_path, 'wb') as f:
+            total_size = int(resp.headers.get('Content-Length', 0))
+            with lock:
+                tasks[url]['total'] = total_size
+
+            chunk_size = 64 * 1024
+            while True:
+                chunk = resp.read(chunk_size)
+                if not chunk:
+                    break
+                f.write(chunk)
+                with lock:
+                    tasks[url]['downloaded'] += len(chunk)
+        os.rename(part_path, out_path)
+    except Exception:
+        if os.path.exists(part_path):
+            os.remove(part_path)
+    finally:
+        with lock:
+            tasks[url]['done'] = True
+            tasks[url]['active'] = False
+            completed_files += 1
+
+MAX_WORKERS = 8
+threads = []
+for u in urls:
+    t = threading.Thread(target=worker, args=(u,), daemon=True)
+    threads.append(t)
+
+SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+spin_idx = 0
+
+for t in threads:
+    while len([th for th in threads if th.is_alive()]) >= MAX_WORKERS:
+        time.sleep(0.04)
+    t.start()
+
+sys.stdout.write("\033[?25l") # Hide cursor
+sys.stdout.flush()
+
+last_rendered_lines = 0
+
+try:
+    while completed_files < total_files:
+        spin_idx = (spin_idx + 1) % len(SPINNER)
+        char = SPINNER[spin_idx]
+
+        with lock:
+            header = f"\033[1;36m{char}\033[0m \033[1mFetching packages...\033[0m ({completed_files}/{total_files})\n"
+            lines = [header]
+            active_items = [v for v in tasks.values() if v['active']]
+            
+            for item in active_items[:4]:
+                cur = human_bytes(item['downloaded'])
+                tot = human_bytes(item['total']) if item['total'] > 0 else "  ?.?? MiB"
+                bar_len = 22
+                if item['total'] > 0:
+                    pct = min(1.0, item['downloaded'] / item['total'])
+                    filled = int(bar_len * pct)
+                    bar = "━" * filled + "╸" + "━" * (bar_len - filled - 1) if filled < bar_len else "━" * bar_len
+                else:
+                    bar = "━" * bar_len
+
+                lines.append(f"  \033[32m{item['name']:<20}\033[0m \033[90m{bar}\033[0m {cur}/{tot}\n")
+
+        if last_rendered_lines > 0:
+            sys.stdout.write(f"\033[{last_rendered_lines}A\033[J")
+        sys.stdout.write("".join(lines))
+        sys.stdout.flush()
+        last_rendered_lines = len(lines)
+        time.sleep(0.08)
+finally:
+    if last_rendered_lines > 0:
+        sys.stdout.write(f"\033[{last_rendered_lines}A\033[J")
+    sys.stdout.write("\033[?25h") # Show cursor
+    sys.stdout.flush()
+
+print(f"\033[32m✔\033[0m Synchronized {total_files} packages.")
+EOF
+}
+
+# ==============================================
+# SUBCOMMAND: UPDATE
+# ==============================================
+do_update() {
+    init_env
+    get_apt_opts
+    
+    echo -e "\e[1;36m⠹\e[0m Updating package indices for [$CODENAME] ($ARCH)..."
+
+    POCKETS=("$CODENAME" "${CODENAME}-updates" "${CODENAME}-security")
+    COMPONENTS=("main" "universe" "multiverse" "restricted")
+    PREFIX="archive.ubuntu.com_ubuntu_dists"
+
+    for pocket in "${POCKETS[@]}"; do
+        for comp in "${COMPONENTS[@]}"; do
+            TARGET="${APT_STATE}/${PREFIX}_${pocket}_${comp}_binary-${ARCH}_Packages"
+            URL_XZ="${MIRROR}/dists/${pocket}/${comp}/binary-${ARCH}/Packages.xz"
+            URL_GZ="${MIRROR}/dists/${pocket}/${comp}/binary-${ARCH}/Packages.gz"
+
+            echo -n "  - Fetching ${pocket}/${comp}... "
+            if wget -q --spider "$URL_XZ" 2>/dev/null; then
+                wget -q -O - "$URL_XZ" | xz -d > "$TARGET" 2>/dev/null
+                echo -e "\e[32m[OK]\e[0m"
+            elif wget -q --spider "$URL_GZ" 2>/dev/null; then
+                wget -q -O - "$URL_GZ" | gzip -d > "$TARGET" 2>/dev/null
+                echo -e "\e[32m[OK]\e[0m"
+            else
+                rm -f "$TARGET"
+                echo -e "\e[90m[Skipped]\e[0m"
+            fi
+        done
+    done
+    echo -e "\e[32m✔\e[0m Package indices up to date."
+}
+
+# ==============================================
+# SUBCOMMAND: SEARCH (FEATURE 4)
+# ==============================================
+do_search() {
+    local QUERY="$1"
+    [ -z "$QUERY" ] && { echo "Usage: mpm search <query>"; exit 1; }
+    init_env
+    get_apt_opts
+
+    apt-cache "${APT_OPTS[@]}" search "$QUERY" | awk '{printf "\033[32m%-25s\033[0m %s\n", $1, substr($0, index($0,$2))}'
+}
+
+# ==============================================
+# SUBCOMMAND: ADD-REPO / PPA (FEATURE 6)
+# ==============================================
+do_add_repo() {
+    local REPO="$1"
+    [ -z "$REPO" ] && { echo "Usage: mpm add-repo <ppa:author/name | repo-url>"; exit 1; }
+    init_env
+
+    if [[ "$REPO" == ppa:* ]]; then
+        local ppa_spec="${REPO#ppa:}"
+        local author="${ppa_spec%/*}"
+        local name="${ppa_spec#*/}"
+        local repo_file="$SOURCES_D/${author}-${name}.list"
+
+        echo "deb http://ppa.launchpad.net/$author/$name/ubuntu $CODENAME main" > "$repo_file"
+        echo -e "\e[32m✔\e[0m Added PPA: \e[1m$REPO\e[0m (Run \e[33mmpm update\e[0m to refresh)"
+    else
+        local repo_file="$SOURCES_D/custom_$(date +%s).list"
+        echo "$REPO" > "$repo_file"
+        echo -e "\e[32m✔\e[0m Added repository into $repo_file"
+    fi
+}
+
+# ==============================================
+# SUBCOMMAND: INSTALL (FEATURES 1, 2, 3, 5, 8)
+# ==============================================
+do_install() {
+    local PKG="$1"
+    [ -z "$PKG" ] && { echo "Usage: mpm install [-n <env>] <package>"; exit 1; }
+
+    init_env
+    get_apt_opts
+    local TARGET_DIR
+    TARGET_DIR="$(get_install_dir)"
+    mkdir -p "$TARGET_DIR"
+
+    echo -e "\e[1;36m⠹\e[0m Resolving dependencies for \e[1m$PKG\e[0m..."
+    RAW_OUTPUT=$(apt-get "${APT_OPTS[@]}" install --reinstall --print-uris -qq "$PKG" 2>&1)
+    readarray -t URLS < <(echo "$RAW_OUTPUT" | cut -d"'" -f2 | grep '\.deb$')
+
+    if [ ${#URLS[@]} -eq 0 ]; then
+        echo -e "\e[31mError resolving package $PKG.\e[0m Apt said:"
+        echo "$RAW_OUTPUT"
+        exit 1
+    fi
+
+    # Parallel download to cache
+    parallel_download "$CACHE_DIR" "${URLS[@]}"
+
+    echo -e "\e[1;36m⠹\e[0m Inspecting conflicts & extracting packages to \e[1m$TARGET_DIR\e[0m..."
+
+    for u in "${URLS[@]}"; do
+        local deb_name
+        deb_name=$(basename "${u%%\?*}")
+        local deb_path="$CACHE_DIR/$deb_name"
+        [ -f "$deb_path" ] || continue
+
+        local current_pkg
+        current_pkg=$(dpkg-deb -f "$deb_path" Package 2>/dev/null || echo "$deb_name")
+        local current_ver
+        current_ver=$(dpkg-deb -f "$deb_path" Version 2>/dev/null || echo "unknown")
+
+        # Conflict checking and file-ownership recording (Feature 8)
+        python3 - "$DB_FILE" "$current_pkg" "$current_ver" "$TARGET_DIR" "$deb_path" << 'EOF'
+import sys, sqlite3, subprocess
+
+db_path, pkg_name, pkg_ver, target_dir, deb_file = sys.argv[1:6]
+con = sqlite3.connect(db_path)
+cur = con.cursor()
+
+# Extract file paths from deb
+out = subprocess.check_output(['dpkg', '-c', deb_file]).decode('utf-8')
+deb_files = []
+for line in out.splitlines():
+    parts = line.split()
+    if len(parts) >= 6:
+        fpath = parts[5].lstrip('.')
+        if fpath and not fpath.endswith('/'):
+            deb_files.append(fpath)
+
+# Verify conflict
+cur.execute("SELECT path, package_name FROM owned_files WHERE install_prefix=?", (target_dir,))
+existing = dict(cur.fetchall())
+
+for f in deb_files:
+    if f in existing and existing[f] != pkg_name:
+        # File owned by someone else
+        print(f"\033[33mWarning:\033[0m Overwriting {f} (previously installed by '{existing[f]}')")
+
+# Insert/Update ownership
+for f in deb_files:
+    cur.execute("""
+        INSERT INTO owned_files (path, package_name, install_prefix) 
+        VALUES (?, ?, ?)
+        ON CONFLICT(path, install_prefix) DO UPDATE SET package_name=excluded.package_name
+    """, (f, pkg_name, target_dir))
+
+cur.execute("""
+    INSERT INTO installed_packages (name, version, install_prefix)
+    VALUES (?, ?, ?)
+    ON CONFLICT(name, install_prefix) DO UPDATE SET version=excluded.version
+""", (pkg_name, pkg_ver, target_dir))
+
+con.commit()
+con.close()
+EOF
+
+        # Extract directly into target
+        dpkg -x "$deb_path" "$TARGET_DIR"
+    done
+
+    # Feature 5: Symlink binaries
+    flatten_symlinks "$TARGET_DIR"
+
+    # Feature 1: Patch Dynamic ELF Bindings
+    echo -e "\e[1;36m⠹\e[0m Patching ELF dynamic paths (RUNPATH) with patchelf..."
+    patch_elf_binaries "$TARGET_DIR"
+
+    ensure_bashrc
+
+    echo -e "\e[32m✔ SUCCESS:\e[0m Successfully installed \e[1m$PKG\e[0m into $TARGET_DIR"
+}
+
+# ==============================================
+# SUBCOMMAND: LIST (FEATURE 2)
+# ==============================================
+do_list() {
+    init_env
+    local TARGET_DIR
+    TARGET_DIR="$(get_install_dir)"
+    echo -e "\e[1mInstalled packages in:\e[0m $TARGET_DIR\n"
+    
+    python3 - "$DB_FILE" "$TARGET_DIR" << 'EOF'
+import sys, sqlite3
+db_path, prefix = sys.argv[1:3]
+con = sqlite3.connect(db_path)
+cur = con.cursor()
+cur.execute("SELECT name, version, installed_at FROM installed_packages WHERE install_prefix=? ORDER BY name", (prefix,))
+rows = cur.fetchall()
+if not rows:
+    print("  No packages installed.")
+else:
+    for name, ver, dt in rows:
+        print(f"  \033[32m✔\033[0m \033[1m{name:<25}\033[0m {ver:<20} \033[90m({dt})\033[0m")
+con.close()
+EOF
+}
+
+# ==============================================
+# SUBCOMMAND: REMOVE (FEATURE 2)
+# ==============================================
+do_remove() {
+    local PKG="$1"
+    [ -z "$PKG" ] && { echo "Usage: mpm remove <package>"; exit 1; }
+    init_env
+    local TARGET_DIR
+    TARGET_DIR="$(get_install_dir)"
+
+    echo -e "\e[1;36m⠹\e[0m Removing \e[1m$PKG\e[0m..."
+
+    python3 - "$DB_FILE" "$PKG" "$TARGET_DIR" << 'EOF'
+import sys, os, sqlite3
+
+db_path, pkg, prefix = sys.argv[1:4]
+con = sqlite3.connect(db_path)
+cur = con.cursor()
+
+cur.execute("SELECT path FROM owned_files WHERE package_name=? AND install_prefix=?", (pkg, prefix))
+files = cur.fetchall()
+
+if not files:
+    print(f"Package '{pkg}' is not recorded as installed in {prefix}")
+    sys.exit(1)
+
+deleted = 0
+for (path,) in files:
+    full_path = os.path.normpath(os.path.join(prefix, path.lstrip('/')))
+    if os.path.exists(full_path) or os.path.islink(full_path):
+        try:
+            os.remove(full_path)
+            deleted += 1
+        except Exception:
+            pass
+
+# Clean DB records
+cur.execute("DELETE FROM owned_files WHERE package_name=? AND install_prefix=?", (pkg, prefix))
+cur.execute("DELETE FROM installed_packages WHERE name=? AND install_prefix=?", (pkg, prefix))
+con.commit()
+con.close()
+
+print(f"\033[32m✔\033[0m Removed {deleted} files belonging to {pkg}.")
+EOF
+}
+
+# ==============================================
+# SUBCOMMAND: CLEAN (FEATURE 3)
+# ==============================================
+do_clean() {
+    init_env
+    echo -n "Clearing package cache ($CACHE_DIR)... "
+    rm -rf "${CACHE_DIR:?}"/*
+    echo -e "\e[32m[DONE]\e[0m"
+}
+
+# ==============================================
+# SUBCOMMAND: ENV / VENV MANAGEMENT (FEATURE 7)
+# ==============================================
+do_env() {
+    local SUB="$1"
+    local NAME="$2"
+
+    init_env
+    case "$SUB" in
+        create)
+            [ -z "$NAME" ] && { echo "Usage: mpm env create <name>"; exit 1; }
+            local EDIR="$ENVS_DIR/$NAME"
+            mkdir -p "$EDIR/bin" "$EDIR/lib" "$EDIR/share"
+            cat << EOF > "$EDIR/activate"
+export MPM_ACTIVE_ENV="$NAME"
+export PATH="$EDIR/bin:$PATH"
+export LD_LIBRARY_PATH="$EDIR/lib:$EDIR/usr/lib:$EDIR/usr/lib/x86_64-linux-gnu:\$LD_LIBRARY_PATH"
+export PKG_CONFIG_PATH="$EDIR/lib/pkgconfig:$EDIR/usr/lib/pkgconfig:\$PKG_CONFIG_PATH"
+export MANPATH="$EDIR/share/man:\$MANPATH"
+export PS1="($NAME) \${PS1:-}"
+EOF
+            echo -e "\e[32m✔\e[0m Environment \e[1m$NAME\e[0m created."
+            echo "To activate:"
+            echo -e "  \e[33msource $EDIR/activate\e[0m"
+            ;;
+        list)
+            echo -e "\e[1mAvailable Environments:\e[0m"
+            for d in "$ENVS_DIR"/*; do
+                [ -d "$d" ] || continue
+                local ename
+                ename=$(basename "$d")
+                if [ "$ename" = "$ACTIVE_ENV" ]; then
+                    echo -e "  * \e[32m$ename\e[0m \033[90m(currently active)\033[0m"
+                else
+                    echo -e "    $ename"
+                fi
+            done
+            ;;
+        *)
+            echo "Usage: mpm env {create <name>|list}"
+            ;;
+    esac
+}
+
+do_run() {
+    local ENV_NAME="$1"
+    shift
+    local EDIR="$ENVS_DIR/$ENV_NAME"
+    if [ ! -d "$EDIR" ]; then
+        echo "Error: Environment $ENV_NAME does not exist."
+        exit 1
+    fi
+    PATH="$EDIR/bin:$PATH" \
+    LD_LIBRARY_PATH="$EDIR/lib:$EDIR/usr/lib:$EDIR/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH" \
+    "$@"
+}
+
+# ==============================================
+# CLI PARSER DISPATCHER
+# ==============================================
+TARGET_ENV=""
+while [[ "$1" =~ ^- ]]; do
+    case "$1" in
+        -n|--env)
+            TARGET_ENV="$2"
+            shift 2
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
+COMMAND="$1"
+shift || true
+
+case "$COMMAND" in
+    update)   do_update ;;
+    search)   do_search "$1" ;;
+    install)  do_install "$1" ;;
+    remove)   do_remove "$1" ;;
+    list)     do_list ;;
+    clean)    do_clean ;;
+    add-repo) do_add_repo "$1" ;;
+    env)      do_env "$1" "$2" ;;
+    run)      ENV="$1"; shift; do_run "$ENV" "$@" ;;
+    *)
+        echo "MPM: Modern Rootless Package Manager"
+        echo "Usage: mpm [-n <env>] <command> [arguments]"
+        echo ""
+        echo "Commands:"
+        echo "  update                  Update repository package catalogs"
+        echo "  search <query>          Search for package in remote indices"
+        echo "  install <package>       Install package and resolve dependencies"
+        echo "  remove <package>        Safely uninstall package files"
+        echo "  list                    List installed packages"
+        echo "  clean                   Free downloaded .deb cache"
+        echo "  add-repo <ppa|repo>     Add Launchpad PPA or custom repository"
+        echo "  env create <name>       Create an isolated virtual environment"
+        echo "  env list                List virtual environments"
+        echo "  run -n <env> <cmd>      Run command inside an isolated environment"
+        ;;
+esac
