@@ -27,7 +27,7 @@ Downloads are fetched in parallel with an active terminal progress display inspi
 You can install `mpm` by cloning the repository or running the bootstrap script:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/<YOUR-GITHUB-USERNAME>/mpm/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/nj2216/mpm/main/install.sh | bash
 ```
 
 Make sure `~/.local/bin` is present in your `$PATH`.
@@ -35,7 +35,7 @@ Make sure `~/.local/bin` is present in your `$PATH`.
 Alternatively, copy `bin/mpm` directly into any directory on your `$PATH` and ensure it is marked executable:
 
 ```bash
-git clone https://github.com/<YOUR-GITHUB-USERNAME>/mpm.git
+git clone https://github.com/nj2216/mpm.git
 cd mpm
 chmod +x bin/mpm
 cp bin/mpm ~/.local/bin/
