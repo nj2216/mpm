@@ -21,27 +21,29 @@ fi
 
 chmod +x "$BIN_DIR/mpm"
 
-# 3. Ensure ~/.local/bin is in PATH for bash & zsh
-add_path() {
+# 3. Configure shell startup idempotently without pollution
+configure_shell() {
     local rc="$1"
-    local line='export PATH="$HOME/.local/bin:$PATH"'
-    if [ -f "$rc" ] && ! grep -q "$HOME/.local/bin" "$rc"; then
-        echo -e "\n# Added by mpm installer\n$line" >> "$rc"
-        echo -e "\033[32m✔\033[0m Added ~/.local/bin to $rc"
+    [ -f "$rc" ] || return 0
+
+    local START_MARKER="# >>> mpm initialize >>>"
+    local END_MARKER="# <<< mpm initialize <<<"
+
+    # Only add if the marker block doesn't already exist
+    if ! grep -q "$START_MARKER" "$rc" 2>/dev/null; then
+        cat << 'EOF' >> "$rc"
+
+# >>> mpm initialize >>>
+export PATH="$HOME/.local/bin:$PATH"
+command -v mpm >/dev/null 2>&1 && eval "$(mpm shell-hook)"
+# <<< mpm initialize <<<
+EOF
+        echo -e "\033[32m✔\033[0m Added clean configuration block to $rc"
     fi
 }
 
-add_path "$HOME/.bashrc"
-add_path "$HOME/.zshrc"
-
-# Add shell integration to ~/.bashrc or ~/.zshrc
-if ! grep -q "mpm shell-hook" ~/.bashrc 2>/dev/null; then
-    echo 'eval "$(mpm shell-hook)"' >> ~/.bashrc
-fi
-
-if [ -f ~/.zshrc ] && ! grep -q "mpm shell-hook" ~/.zshrc 2>/dev/null; then
-    echo 'eval "$(mpm shell-hook)"' >> ~/.zshrc
-fi
+configure_shell "$HOME/.bashrc"
+[ -f "$HOME/.zshrc" ] && configure_shell "$HOME/.zshrc"
 
 echo -e "\033[32m✔ Installation complete!\033[0m"
 echo ""

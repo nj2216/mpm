@@ -6,6 +6,11 @@
 
 set -e
 
+VERSION="2.1.0"
+REPO_OWNER="nj2216"
+REPO_NAME="mpm"
+REPO_URL="https://raw.githubusercontent.com/$REPO_OWNER/$REPO_NAME/main/bin/mpm"
+
 BASE_DIR="$HOME/.local_apt"
 ENVS_GLOBAL_DIR="$HOME/.local/share/mpm/environments"
 CACHE_DIR="$HOME/.cache/mpm/archives"
@@ -33,8 +38,6 @@ VERBOSE=false
 get_target_prefix() {
     if [ -n "$TARGET_ENV" ]; then
         echo "$ENVS_GLOBAL_DIR/$TARGET_ENV"
-    elif [ -n "$MPM_ACTIVE_PREFIX" ]; then
-        echo "$MPM_ACTIVE_PREFIX"
     else
         echo "$(pwd)/.mpm"
     fi
@@ -54,10 +57,23 @@ init_apt_env() {
              "$CACHE_DIR" \
              "$ENVS_GLOBAL_DIR"
 
-    if [ -f /var/lib/dpkg/status ]; then
-        STATUS_FILE="/var/lib/dpkg/status"
-    else
-        STATUS_FILE="$BASE_DIR/status"
+    STATUS_FILE="$BASE_DIR/status"
+
+    if [ ! -s "$STATUS_FILE" ]; then
+        if [ -f /var/lib/dpkg/status ]; then
+            awk '
+                BEGIN { RS=""; ORS="\n\n" }
+                /^Package: (libc6|libgcc-s1|libstdc\+\+6)($|\n)/ {
+                    for (i = 1; i <= NF; i++) {
+                        if ($i ~ /^Depends:/) {
+                            while (i <= NF && $(i+1) ~ /^ /) i++
+                            continue
+                        }
+                    }
+                    print "Package: " $2 "\nStatus: install ok installed\nArchitecture: " "'"$ARCH"'" "\nVersion: 999:99.9"
+                }
+            ' /var/lib/dpkg/status > "$STATUS_FILE" 2>/dev/null || true
+        fi
         touch "$STATUS_FILE"
     fi
 }
@@ -105,7 +121,6 @@ deactivate () {
     fi
 }
 
-# If already in an active environment, deactivate it first
 if [ -n "${MPM_ACTIVE_PREFIX:-}" ]; then
     deactivate
 fi
@@ -114,11 +129,9 @@ _OLD_MPM_PATH="$PATH"
 _OLD_MPM_LD_PATH="${LD_LIBRARY_PATH:-}"
 _OLD_MPM_PS1="${PS1:-}"
 
-# The environment root is the folder containing this activate script (.mpm)
 ENV_BASE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export MPM_ACTIVE_PREFIX="$ENV_BASE"
 
-# Auto-discover all library folders inside .mpm
 RAW_LIBS=$(find "$ENV_BASE" -type d \( -name "lib" -o -name "*linux-gnu" \) 2>/dev/null | tr '\n' ':')
 CLEAN_LIBS="${RAW_LIBS%:}"
 
@@ -127,7 +140,6 @@ if [ -n "$CLEAN_LIBS" ]; then
 fi
 export PATH="$ENV_BASE/bin:$ENV_BASE/usr/bin:$ENV_BASE/usr/games:$PATH"
 
-# Parent folder name for a clean prompt, e.g. (tmpm)
 PROJECT_NAME="$(basename "$(cd "$ENV_BASE/.." && pwd)")"
 PS1="($PROJECT_NAME) ${PS1:-}"
 export PS1
@@ -342,7 +354,7 @@ do_install() {
     log_verbose "Target prefix: $PREFIX"
 
     set +e
-    RAW_OUTPUT=$(/usr/bin/apt-get "${APT_OPTS[@]}" install --reinstall --no-install-recommends --print-uris -qq "$PACKAGE" 2>&1)
+    RAW_OUTPUT=$(/usr/bin/apt-get "${APT_OPTS[@]}" install --reinstall --no-install-recommends -o APT::Get::Fix-Broken=false --print-uris -qq "$PACKAGE" 2>&1)
     APT_CODE=$?
     set -e
 
@@ -367,6 +379,14 @@ do_install() {
         deb_name=$(basename "${u%%\?*}")
         local deb_path="$CACHE_DIR/$deb_name"
         [ -f "$deb_path" ] || continue
+
+        # Never unpack libc6 or base tzdata into user-space environments
+        case "$deb_name" in
+            libc6*|locales*|tzdata*)
+                log_verbose "Skipping host-provided base package: $deb_name"
+                continue
+                ;;
+        esac
 
         dpkg -x "$deb_path" "$PREFIX"
     done
@@ -463,7 +483,54 @@ do_init() {
 }
 
 # ==========================================
-# 6. SHELL HOOK INTEGRATION
+# 6. SELF-UPDATE SUBCOMMAND
+# ==========================================
+do_self_update() {
+    echo -e "\e[1;36m⠹\e[0m Checking for updates from \e[1m$REPO_OWNER/$REPO_NAME\e[0m..."
+
+    # Determine currently executing binary location
+    local current_bin
+    current_bin=$(command -v mpm 2>/dev/null || echo "$HOME/.local/bin/mpm")
+
+    # If running directly from a symlink/source path, resolve it
+    if [ -L "$current_bin" ]; then
+        current_bin=$(readlink -f "$current_bin")
+    fi
+
+    local tmp_file
+    tmp_file=$(mktemp "/tmp/mpm_update.XXXXXX")
+
+    # Download latest master/main version
+    if command -v curl &>/dev/null; then
+        curl -fsSL "$REPO_URL" -o "$tmp_file"
+    elif command -v wget &>/dev/null; then
+        wget -qO "$tmp_file" "$REPO_URL"
+    else
+        echo "Error: curl or wget is required for self-update." >&2
+        rm -f "$tmp_file"
+        exit 1
+    fi
+
+    # Integrity & syntax check before applying
+    if ! bash -n "$tmp_file" 2>/dev/null; then
+        echo -e "\e[31mUpdate failed:\e[0m Downloaded file failed syntax verification." >&2
+        rm -f "$tmp_file"
+        exit 1
+    fi
+
+    # Read remote version if available
+    local remote_version
+    remote_version=$(grep -m1 '^VERSION=' "$tmp_file" | cut -d'"' -f2 || echo "latest")
+
+    chmod +x "$tmp_file"
+    mv -f "$tmp_file" "$current_bin"
+
+    echo -e "\e[32m✔ MPM successfully updated to version $remote_version!\e[0m"
+    echo "Binary updated at: $current_bin"
+}
+
+# ==========================================
+# 7. SHELL HOOK INTEGRATION
 # ==========================================
 do_shell_hook() {
     cat << 'EOF'
@@ -533,12 +600,16 @@ case "$COMMAND" in
     install)     do_install "$1" ;;
     run)         do_run "$@" ;;
     clean)       rm -rf "${CACHE_DIR:?}"/* && echo "Cache cleaned." ;;
+    self-update) do_self_update ;;
     shell-hook)  do_shell_hook ;;
     activate)
         echo "Notice: To activate environments directly with 'mpm activate', run:"
         echo '  eval "$(mpm shell-hook)"'
         echo "Or source the file directly:"
         echo "  source .mpm/activate"
+        ;;
+    version|--version|-V)
+        echo "mpm version $VERSION"
         ;;
     *)
         echo "MPM: Modern Rootless Package Manager (Isolated Environments)"
@@ -551,6 +622,8 @@ case "$COMMAND" in
         echo "  search <query>          Search package in remote indices"
         echo "  update                  Update index cache"
         echo "  clean                   Clear downloaded .deb cache"
+        echo "  self-update             Update mpm binary to latest version from GitHub"
         echo "  shell-hook              Generate shell integration code for mpm activate"
+        echo "  version                 Show mpm version"
         ;;
 esac
